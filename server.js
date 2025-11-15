@@ -1,3 +1,4 @@
+// server.js - proxy for .m3u8 and .ts (supports /proxy and /stream)
 const express = require('express');
 const axios = require('axios');
 const morgan = require('morgan');
@@ -12,7 +13,7 @@ app.use(morgan('tiny'));
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Range,Content-Type,Authorization');
+  res.setHeader('Access-Control-Allow-Headers', 'Range,Content-Type,Authorization,Referer,Origin');
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 });
@@ -35,7 +36,7 @@ function safeDecodeUrl(u) {
   }
 }
 
-app.get('/proxy', async (req, res) => {
+async function handleProxy(req, res) {
   if (!checkToken(req, res)) return;
   const raw = req.query.url;
   if (!raw) return res.status(400).send('Missing url param');
@@ -61,24 +62,24 @@ app.get('/proxy', async (req, res) => {
       const lines = playlist.split(/\r?\n/);
       const rewritten = lines.map((line) => {
         if (!line || line.startsWith('#')) return line;
-
         let absolute;
         try { absolute = new URL(line, baseUrl).toString(); }
         catch (e) { absolute = line; }
-
         const encoded = encodeURIComponent(absolute);
         const tokenPart = REQUIRED_TOKEN ? `&token=${REQUIRED_TOKEN}` : '';
-
+        // use same hostname + path (/proxy) for segments
         return `${req.protocol}://${req.get('host')}/proxy?url=${encoded}${tokenPart}`;
       }).join('\n');
 
       res.setHeader('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
       return res.status(200).send(rewritten);
-    }
-
-    else {
+    } else {
       const headers = {};
       if (req.headers.range) headers.Range = req.headers.range;
+      // Forward referer if present in query (some streams need it)
+      if (req.query.referer) headers.Referer = req.query.referer;
+      // Add user-agent to help some CDNs
+      headers['User-Agent'] = req.headers['user-agent'] || 'Mozilla/5.0 (compatible)';
 
       const resp = await axios({
         method: 'get',
@@ -92,10 +93,8 @@ app.get('/proxy', async (req, res) => {
 
       if (resp.headers['content-type'])
         res.setHeader('Content-Type', resp.headers['content-type']);
-
       if (resp.headers['content-length'])
         res.setHeader('Content-Length', resp.headers['content-length']);
-
       if (resp.headers['accept-ranges'])
         res.setHeader('Accept-Ranges', resp.headers['accept-ranges']);
 
@@ -103,15 +102,18 @@ app.get('/proxy', async (req, res) => {
       resp.data.pipe(res);
       resp.data.on('error', () => { try { res.end(); } catch(e){} });
     }
-
   } catch (err) {
     console.error('Proxy error', err?.message);
     return res.status(502).send('Bad gateway: ' + (err?.message || 'unknown error'));
   }
+}
+
+app.get(['/proxy','/stream'], (req, res) => {
+  return handleProxy(req, res);
 });
 
 app.get('/', (req, res) => {
-  res.send('Stream proxy running. Use /proxy?url=<encoded_url>');
+  res.send('Stream proxy running. Use /proxy?url=<encoded_url>&token=YOUR_TOKEN');
 });
 
 app.listen(PORT, () => {
